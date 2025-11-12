@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WebGPU Test - NVIDIA</title>
+    <style>
+        body { font-family: monospace; padding: 20px; max-width: 800px; }
+        #output { white-space: pre-wrap; background: #f0f0f0; padding: 15px; 
+                  border-radius: 5px; margin: 10px 0; }
+        button { padding: 12px 24px; font-size: 16px; cursor: pointer; margin: 5px; }
+        .error { color: red; }
+        .success { color: green; }
+    </style>
+</head>
+<body>
+    <h1>Message Passing Test - NVIDIA RTX 4090</h1>
+    <button onclick="runTest(1000)">Run 1K iterations</button>
+    <button onclick="runTest(10000)">Run 10K iterations</button>
+    <div id="output">Initializing...</div>
+
+<script>
+const shaderCode = `
+@group(0) @binding(0) var<storage, read_write> results: array<u32>;
+
+var<workgroup> data: atomic<u32>;
+var<workgroup> flag: atomic<u32>;
+
+@compute @workgroup_size(2, 1, 1)
+fn main(@builtin(local_invocation_index) idx: u32) {
+    // Initialize (only thread 0)
+    if (idx == 0u) {
+        atomicStore(&data, 0u);
+        atomicStore(&flag, 0u);
+    }
+    
+    // Wait for initialization to complete
+    workgroupBarrier();
+    
+    // Thread 0: Sender - write data then flag (NO barrier between!)
+    if (idx == 0u) {
+        atomicStore(&data, 42u);
+        atomicStore(&flag, 1u);
+    }
+    
+    // Thread 1: Receiver - wait for flag, then read data
+    if (idx == 1u) {
+        // Busy-wait for flag
+        var saw_flag = false;
+        for (var i = 0u; i < 100000u; i = i + 1u) {
+            if (atomicLoad(&flag) == 1u) {
+                saw_flag = true;
+                break;
+            }
+        }
+        
+        var r = 0u;
+        if (saw_flag) {
+            r = atomicLoad(&data);
+        } else {
+            r = 999u; // timeout
+        }
+        
+        results[idx] = r;
+    }
+    
+    // Final barrier to ensure both threads complete
+    workgroupBarrier();
+}
+`;
+
+let device = null;
+let adapter = null;
+const output = document.getElementById('output');
+
+async function init() {
+    output.textContent = "Checking WebGPU support...";
+    
+    if (!navigator.gpu) {
+        output.innerHTML = '<span class="error">❌ WebGPU NOT supported!</span>';
+        return false;
+    }
+    
+    try {
+        adapter = await navigator.gpu.requestAdapter();
+        if (!adapter) {
+            output.innerHTML = '<span class="error">❌ No GPU adapter!</span>';
+            return false;
+        }
+        
+        device = await adapter.requestDevice();
+        
+        output.innerHTML = `<span class="success">✅ WebGPU Ready!</span>\n\n` +
+                          `GPU: NVIDIA RTX 4090\n` +
+                          `Platform: Ubuntu Linux\n\n` +
+                          `This version has NO barrier between the two stores.\n` +
+                          `We should see mostly r=42, but occasional r=0 if reordering happens.\n\n` +
+                          `Click a button to run test.`;
+        return true;
+    } catch (e) {
+        output.innerHTML = `<span class="error">❌ Error:</span> ${e.message}`;
+        console.error(e);
+        return false;
+    }
+}
+
+async function runTest(iterations) {
+    if (!device) {
+        const ok = await init();
+        if (!ok) return;
+    }
+    
+    output.textContent = `Running ${iterations} iterations...\nThis will take a minute...`;
+    const startTime = performance.now();
+    
+    try {
+        const module = device.createShaderModule({ code: shaderCode });
+        const pipeline = device.createComputePipeline({
+            layout: 'auto',
+            compute: { module, entryPoint: 'main' }
+        });
+        
+        const resultBuffer = device.createBuffer({
+            size: 8,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+        });
+        
+        const readBuffer = device.createBuffer({
+            size: 8,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+        });
+        
+        const bindGroup = device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [{ binding: 0, resource: { buffer: resultBuffer } }]
+        });
+        
+        let outcomes = { '42': 0, '0': 0, '999': 0, 'other': 0 };
+        
+        for (let i = 0; i < iterations; i++) {
+            const encoder = device.createCommandEncoder();
+            const pass = encoder.beginComputePass();
+            pass.setPipeline(pipeline);
+            pass.setBindGroup(0, bindGroup);
+            pass.dispatchWorkgroups(1);
+            pass.end();
+            encoder.copyBufferToBuffer(resultBuffer, 0, readBuffer, 0, 8);
+            device.queue.submit([encoder.finish()]);
+            
+            await readBuffer.mapAsync(GPUMapMode.READ);
+            const results = new Uint32Array(readBuffer.getMappedRange());
+            const result = results[1];
+            readBuffer.unmap();
+            
+            if (result === 42) outcomes['42']++;
+            else if (result === 0) outcomes['0']++;
+            else if (result === 999) outcomes['999']++;
+            else outcomes['other']++;
+            
+            if (i % 500 === 0 && i > 0) {
+                output.textContent = `Progress: ${i}/${iterations} (${((i/iterations)*100).toFixed(0)}%)`;
+            }
+        }
+        
+        const elapsed = ((performance.now() - startTime) / 1000).toFixed(2);
+        
+        const reorderPct = (outcomes['0']/iterations*100).toFixed(2);
+        
+        output.innerHTML = `<span class="success">✅ Test Complete!</span>\n\n` +
+                          `Machine: NVIDIA RTX 3090 (Ubuntu)\n` +
+                          `Test: Message Passing (no barrier between stores)\n` +
+                          `Iterations: ${iterations}\n` +
+                          `Time: ${elapsed}s\n\n` +
+                          `RESULTS:\n` +
+                          `  r = 42:      ${outcomes['42'].toString().padStart(6)} (${(outcomes['42']/iterations*100).toFixed(2)}%)\n` +
+                          `  r = 0:       ${outcomes['0'].toString().padStart(6)} (${reorderPct}%)\n` +
+                          `  timeout:     ${outcomes['999'].toString().padStart(6)} (${(outcomes['999']/iterations*100).toFixed(2)}%)\n` +
+                          `  other:       ${outcomes['other'].toString().padStart(6)} (${(outcomes['other']/iterations*100).toFixed(2)}%)\n\n` +
+                          `INTERPRETATION:\n` +
+                          `${outcomes['0'] > 0 ? 
+                            `⚠️  REORDERING DETECTED!\n   In ${reorderPct}% of runs, Thread 1 saw flag=1 but data=0.\n   This means the GPU reordered or delayed visibility of the stores.` : 
+                            '✓  No reordering observed. All atomics maintained program order.'}` +
+                          `${outcomes['999'] > iterations * 0.01 ? 
+                            '\n\n⚠️  High timeout rate suggests thread synchronization issues.' : ''}`;
+        
+        console.log('Detailed results:', outcomes);
+        
+    } catch (e) {
+        output.innerHTML = `<span class="error">❌ Error during test:</span>\n${e.message}\n\nCheck browser console for details.`;
+        console.error('Full error:', e);
+    }
+}
+
+window.addEventListener('load', init);
+</script>
+</body>
+</html>

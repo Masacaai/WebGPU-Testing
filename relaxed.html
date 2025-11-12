@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Relaxed Test - NVIDIA</title>
+    <style>
+        body { font-family: monospace; padding: 20px; max-width: 800px; }
+        #output { white-space: pre-wrap; background: #f0f0f0; padding: 15px; 
+                  border-radius: 5px; margin: 10px 0; }
+        button { padding: 12px 24px; font-size: 16px; cursor: pointer; margin: 5px; }
+    </style>
+</head>
+<body>
+    <h1>Coherence Test - Multiple Memory Locations</h1>
+    <button onclick="runTest(10000)">Run 10K iterations</button>
+    <div id="output">Initializing...</div>
+
+<script>
+const shaderCode = `
+@group(0) @binding(0) var<storage, read_write> results: array<u32>;
+
+var<workgroup> x: atomic<u32>;
+var<workgroup> y: atomic<u32>;
+var<workgroup> z: atomic<u32>;
+var<workgroup> w: atomic<u32>;
+
+@compute @workgroup_size(4, 1, 1)
+fn main(@builtin(local_invocation_index) idx: u32) {
+    // Initialize
+    if (idx == 0u) {
+        atomicStore(&x, 0u);
+        atomicStore(&y, 0u);
+        atomicStore(&z, 0u);
+        atomicStore(&w, 0u);
+    }
+    workgroupBarrier();
+    
+    // Four threads doing different operations
+    if (idx == 0u) {
+        atomicStore(&x, 1u);
+        atomicStore(&y, 1u);
+    }
+    
+    if (idx == 1u) {
+        let r1 = atomicLoad(&y);
+        let r2 = atomicLoad(&x);
+        results[1] = (r1 << 16u) | r2;  // Pack both reads
+    }
+    
+    if (idx == 2u) {
+        atomicStore(&z, 1u);
+        atomicStore(&w, 1u);
+    }
+    
+    if (idx == 3u) {
+        let r3 = atomicLoad(&w);
+        let r4 = atomicLoad(&z);
+        results[3] = (r3 << 16u) | r4;  // Pack both reads
+    }
+    
+    workgroupBarrier();
+}
+`;
+
+let device = null;
+const output = document.getElementById('output');
+
+async function init() {
+    if (!navigator.gpu) {
+        output.innerHTML = '❌ WebGPU NOT supported!';
+        return false;
+    }
+    
+    try {
+        const adapter = await navigator.gpu.requestAdapter();
+        device = await adapter.requestDevice();
+        output.innerHTML = '✅ WebGPU Ready!\n\nGPU: NVIDIA RTX 3090\nTest: 4 threads with independent read/write pairs\n\nClick to run.';
+        return true;
+    } catch (e) {
+        output.innerHTML = `❌ Error: ${e.message}`;
+        return false;
+    }
+}
+
+async function runTest(iterations) {
+    if (!device) {
+        await init();
+    }
+    
+    output.textContent = `Running ${iterations} iterations...`;
+    const startTime = performance.now();
+    
+    try {
+        const module = device.createShaderModule({ code: shaderCode });
+        const pipeline = device.createComputePipeline({
+            layout: 'auto',
+            compute: { module, entryPoint: 'main' }
+        });
+        
+        const resultBuffer = device.createBuffer({
+            size: 16,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+        });
+        
+        const readBuffer = device.createBuffer({
+            size: 16,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+        });
+        
+        const bindGroup = device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [{ binding: 0, resource: { buffer: resultBuffer } }]
+        });
+        
+        let patterns = new Map();
+        
+        for (let i = 0; i < iterations; i++) {
+            const encoder = device.createCommandEncoder();
+            const pass = encoder.beginComputePass();
+            pass.setPipeline(pipeline);
+            pass.setBindGroup(0, bindGroup);
+            pass.dispatchWorkgroups(1);
+            pass.end();
+            encoder.copyBufferToBuffer(resultBuffer, 0, readBuffer, 0, 16);
+            device.queue.submit([encoder.finish()]);
+            
+            await readBuffer.mapAsync(GPUMapMode.READ);
+            const results = new Uint32Array(readBuffer.getMappedRange());
+            
+            const t1_reads = results[1];
+            const t3_reads = results[3];
+            
+            const r1 = (t1_reads >> 16) & 0xFFFF;
+            const r2 = t1_reads & 0xFFFF;
+            const r3 = (t3_reads >> 16) & 0xFFFF;
+            const r4 = t3_reads & 0xFFFF;
+            
+            const pattern = `T1:(${r1},${r2}) T3:(${r3},${r4})`;
+            patterns.set(pattern, (patterns.get(pattern) || 0) + 1);
+            
+            readBuffer.unmap();
+            
+            if (i % 1000 === 0 && i > 0) {
+                output.textContent = `Progress: ${i}/${iterations}`;
+            }
+        }
+        
+        const elapsed = ((performance.now() - startTime) / 1000).toFixed(2);
+        
+        let resultText = `✅ Test Complete!\n\nIterations: ${iterations}\nTime: ${elapsed}s\n\n`;
+        resultText += `OBSERVED PATTERNS:\n`;
+        
+        const sorted = Array.from(patterns.entries()).sort((a, b) => b[1] - a[1]);
+        for (const [pattern, count] of sorted) {
+            const pct = (count / iterations * 100).toFixed(2);
+            resultText += `  ${pattern}: ${count} (${pct}%)\n`;
+        }
+        
+        const uniquePatterns = patterns.size;
+        resultText += `\nTotal unique patterns: ${uniquePatterns}\n`;
+        
+        if (uniquePatterns > 2) {
+            resultText += `\n🔥 INTERESTING! Multiple orderings observed!\nThis shows non-deterministic execution.`;
+        } else {
+            resultText += `\n😐 Only ${uniquePatterns} pattern(s). Very deterministic.`;
+        }
+        
+        output.textContent = resultText;
+        
+    } catch (e) {
+        output.innerHTML = `❌ Error: ${e.message}`;
+        console.error(e);
+    }
+}
+
+window.addEventListener('load', init);
+</script>
+</body>
+</html>

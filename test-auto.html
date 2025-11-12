@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WebGPU Memory Model Test</title>
+    <style>
+        body { font-family: monospace; padding: 20px; max-width: 900px; }
+        #output { white-space: pre-wrap; background: #f0f0f0; padding: 15px; 
+                  border-radius: 5px; margin: 10px 0; min-height: 100px; }
+        button { padding: 12px 24px; font-size: 16px; cursor: pointer; margin: 5px; }
+        .info { background: #e3f2fd; padding: 10px; border-radius: 5px; margin: 10px 0; }
+        .error { color: red; }
+        .success { color: green; }
+    </style>
+</head>
+<body>
+    <h1>GPU Memory Model Litmus Test</h1>
+    <div id="gpuInfo" class="info">Detecting GPU...</div>
+    <button onclick="runTest(1000)">Run 1K iterations</button>
+    <button onclick="runTest(10000)">Run 10K iterations</button>
+    <div id="output">Click a button to run test...</div>
+
+<script>
+const shaderCode = `
+@group(0) @binding(0) var<storage, read_write> results: array<u32>;
+
+var<workgroup> data: atomic<u32>;
+var<workgroup> flag: atomic<u32>;
+
+@compute @workgroup_size(2, 1, 1)
+fn main(@builtin(local_invocation_index) idx: u32) {
+    if (idx == 0u) {
+        atomicStore(&data, 0u);
+        atomicStore(&flag, 0u);
+    }
+    workgroupBarrier();
+    
+    if (idx == 0u) {
+        atomicStore(&data, 42u);
+        atomicStore(&flag, 1u);
+    }
+    
+    if (idx == 1u) {
+        var saw_flag = false;
+        for (var i = 0u; i < 100000u; i = i + 1u) {
+            if (atomicLoad(&flag) == 1u) {
+                saw_flag = true;
+                break;
+            }
+        }
+        
+        var r = 0u;
+        if (saw_flag) {
+            r = atomicLoad(&data);
+        } else {
+            r = 999u;
+        }
+        
+        results[idx] = r;
+    }
+    
+    workgroupBarrier();
+}
+`;
+
+let device = null;
+let adapter = null;
+let gpuInfo = {};
+const output = document.getElementById('output');
+const gpuInfoDiv = document.getElementById('gpuInfo');
+
+async function detectGPU() {
+    if (!navigator.gpu) {
+        gpuInfoDiv.innerHTML = '<span class="error">❌ WebGPU not supported in this browser</span>';
+        return false;
+    }
+    
+    try {
+        adapter = await navigator.gpu.requestAdapter();
+        if (!adapter) {
+            gpuInfoDiv.innerHTML = '<span class="error">❌ No GPU adapter found</span>';
+            return false;
+        }
+        
+        device = await adapter.requestDevice();
+        
+        // Try to get detailed info (newer browsers)
+        let gpuName = 'Unknown GPU';
+        let vendor = 'Unknown Vendor';
+        let architecture = 'Unknown Architecture';
+        
+        // Method 1: requestAdapterInfo (if available)
+        if (adapter.requestAdapterInfo) {
+            try {
+                const info = await adapter.requestAdapterInfo();
+                gpuName = info.device || info.description || adapter.name || 'Unknown GPU';
+                vendor = info.vendor || 'Unknown Vendor';
+                architecture = info.architecture || 'Unknown';
+            } catch (e) {
+                console.log('requestAdapterInfo not available:', e);
+            }
+        }
+        
+        // Method 2: Fallback to adapter properties
+        if (gpuName === 'Unknown GPU' && adapter.name) {
+            gpuName = adapter.name;
+        }
+        
+        // Method 3: Try to infer from limits/features
+        const limits = adapter.limits;
+        const features = Array.from(adapter.features || []);
+        
+        // Store info
+        gpuInfo = {
+            name: gpuName,
+            vendor: vendor,
+            architecture: architecture,
+            backend: detectBackend(),
+            maxWorkgroupSize: limits.maxComputeWorkgroupSizeX,
+            features: features
+        };
+        
+        // Display info
+        gpuInfoDiv.innerHTML = `
+<span class="success">✅ WebGPU Ready</span>
+<strong>GPU:</strong> ${gpuInfo.name}
+<strong>Vendor:</strong> ${gpuInfo.vendor}
+<strong>Backend:</strong> ${gpuInfo.backend}
+<strong>Platform:</strong> ${detectPlatform()}
+<strong>Browser:</strong> ${detectBrowser()}
+        `.trim();
+        
+        console.log('Full GPU info:', gpuInfo);
+        console.log('Adapter limits:', limits);
+        console.log('Features:', features);
+        
+        return true;
+    } catch (e) {
+        gpuInfoDiv.innerHTML = `<span class="error">❌ Error: ${e.message}</span>`;
+        console.error('GPU detection error:', e);
+        return false;
+    }
+}
+
+function detectBackend() {
+    // Try to detect which graphics API is being used
+    const ua = navigator.userAgent.toLowerCase();
+    if (ua.includes('windows')) return 'DirectX 12 (likely)';
+    if (ua.includes('mac')) return 'Metal';
+    if (ua.includes('linux')) return 'Vulkan (likely)';
+    return 'Unknown';
+}
+
+function detectPlatform() {
+    const ua = navigator.userAgent;
+    if (ua.includes('Windows')) return 'Windows';
+    if (ua.includes('Mac')) return 'macOS';
+    if (ua.includes('Linux')) return 'Linux';
+    if (ua.includes('X11')) return 'Linux/X11';
+    return 'Unknown OS';
+}
+
+function detectBrowser() {
+    const ua = navigator.userAgent;
+    if (ua.includes('Chrome') && !ua.includes('Edg')) return 'Chrome';
+    if (ua.includes('Safari') && !ua.includes('Chrome')) return 'Safari';
+    if (ua.includes('Firefox')) return 'Firefox';
+    if (ua.includes('Edg')) return 'Edge';
+    return 'Unknown Browser';
+}
+
+async function runTest(iterations) {
+    if (!device) {
+        const ok = await detectGPU();
+        if (!ok) return;
+    }
+    
+    output.textContent = `Running ${iterations} iterations on ${gpuInfo.name}...\nThis may take a minute...`;
+    const startTime = performance.now();
+    
+    try {
+        const module = device.createShaderModule({ code: shaderCode });
+        const pipeline = device.createComputePipeline({
+            layout: 'auto',
+            compute: { module, entryPoint: 'main' }
+        });
+        
+        const resultBuffer = device.createBuffer({
+            size: 8,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+        });
+        
+        const readBuffer = device.createBuffer({
+            size: 8,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+        });
+        
+        const bindGroup = device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [{ binding: 0, resource: { buffer: resultBuffer } }]
+        });
+        
+        let outcomes = { '42': 0, '0': 0, '999': 0, 'other': 0 };
+        
+        for (let i = 0; i < iterations; i++) {
+            const encoder = device.createCommandEncoder();
+            const pass = encoder.beginComputePass();
+            pass.setPipeline(pipeline);
+            pass.setBindGroup(0, bindGroup);
+            pass.dispatchWorkgroups(1);
+            pass.end();
+            encoder.copyBufferToBuffer(resultBuffer, 0, readBuffer, 0, 8);
+            device.queue.submit([encoder.finish()]);
+            
+            await readBuffer.mapAsync(GPUMapMode.READ);
+            const results = new Uint32Array(readBuffer.getMappedRange());
+            const result = results[1];
+            readBuffer.unmap();
+            
+            if (result === 42) outcomes['42']++;
+            else if (result === 0) outcomes['0']++;
+            else if (result === 999) outcomes['999']++;
+            else outcomes['other']++;
+            
+            if (i % 500 === 0 && i > 0) {
+                output.textContent = `Progress: ${i}/${iterations} (${((i/iterations)*100).toFixed(0)}%)`;
+            }
+        }
+        
+        const elapsed = ((performance.now() - startTime) / 1000).toFixed(2);
+        
+        // Generate results with full system info
+        output.innerHTML = `<span class="success">✅ Test Complete!</span>
+
+SYSTEM INFO:
+  GPU: ${gpuInfo.name}
+  Vendor: ${gpuInfo.vendor}
+  Platform: ${detectPlatform()}
+  Backend: ${gpuInfo.backend}
+  Browser: ${detectBrowser()}
+
+TEST: Message Passing
+  Iterations: ${iterations}
+  Time: ${elapsed}s
+  
+RESULTS:
+  r = 42:      ${outcomes['42'].toString().padStart(6)} (${(outcomes['42']/iterations*100).toFixed(2)}%)
+  r = 0:       ${outcomes['0'].toString().padStart(6)} (${(outcomes['0']/iterations*100).toFixed(2)}%)
+  timeout:     ${outcomes['999'].toString().padStart(6)} (${(outcomes['999']/iterations*100).toFixed(2)}%)
+  other:       ${outcomes['other'].toString().padStart(6)} (${(outcomes['other']/iterations*100).toFixed(2)}%)
+
+INTERPRETATION:
+${outcomes['0'] > 0 ? 
+  `🔥 REORDERING DETECTED!\n   Thread 1 saw flag=1 but data=0 in ${(outcomes['0']/iterations*100).toFixed(2)}% of runs.\n   This indicates relaxed memory ordering.` : 
+  '✓ No reordering observed. Atomics maintained program order.'}
+${outcomes['999'] > iterations * 0.01 ? 
+  '\n⚠️  High timeout rate - possible synchronization issues.' : ''}
+        `.trim();
+        
+        console.log('Results:', outcomes);
+        console.log('GPU Info:', gpuInfo);
+        
+    } catch (e) {
+        output.innerHTML = `<span class="error">❌ Error during test:</span>\n${e.message}`;
+        console.error('Test error:', e);
+    }
+}
+
+// Auto-detect GPU on page load
+window.addEventListener('load', detectGPU);
+</script>
+</body>
+</html>

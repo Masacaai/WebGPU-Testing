@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Store Buffering Test - NVIDIA</title>
+    <style>
+        body { font-family: monospace; padding: 20px; max-width: 800px; }
+        #output { white-space: pre-wrap; background: #f0f0f0; padding: 15px; 
+                  border-radius: 5px; margin: 10px 0; }
+        button { padding: 12px 24px; font-size: 16px; cursor: pointer; margin: 5px; }
+        .error { color: red; }
+        .success { color: green; }
+    </style>
+</head>
+<body>
+    <h1>Store Buffering Test - NVIDIA RTX 3090</h1>
+    <button onclick="runTest(1000)">Run 1K iterations</button>
+    <button onclick="runTest(10000)">Run 10K iterations</button>
+    <div id="output">Initializing...</div>
+
+<script>
+const shaderCode = `
+@group(0) @binding(0) var<storage, read_write> results: array<u32>;
+
+var<workgroup> x: atomic<u32>;
+var<workgroup> y: atomic<u32>;
+
+@compute @workgroup_size(2, 1, 1)
+fn main(@builtin(local_invocation_index) idx: u32) {
+    // Initialize
+    if (idx == 0u) {
+        atomicStore(&x, 0u);
+        atomicStore(&y, 0u);
+    }
+    workgroupBarrier();
+    
+    // Thread 0: Write x=1, read y
+    if (idx == 0u) {
+        atomicStore(&x, 1u);
+        let r0 = atomicLoad(&y);
+        results[0] = r0;
+    }
+    
+    // Thread 1: Write y=1, read x
+    if (idx == 1u) {
+        atomicStore(&y, 1u);
+        let r1 = atomicLoad(&x);
+        results[1] = r1;
+    }
+    
+    workgroupBarrier();
+}
+`;
+
+let device = null;
+let adapter = null;
+const output = document.getElementById('output');
+
+async function init() {
+    output.textContent = "Checking WebGPU support...";
+    
+    if (!navigator.gpu) {
+        output.innerHTML = '<span class="error">❌ WebGPU NOT supported!</span>';
+        return false;
+    }
+    
+    try {
+        adapter = await navigator.gpu.requestAdapter();
+        if (!adapter) {
+            output.innerHTML = '<span class="error">❌ No GPU adapter!</span>';
+            return false;
+        }
+        
+        device = await adapter.requestDevice();
+        
+        output.innerHTML = `<span class="success">✅ WebGPU Ready!</span>\n\n` +
+                          `GPU: NVIDIA RTX 3090\n` +
+                          `Test: Store Buffering\n\n` +
+                          `This test checks if both threads can miss each other's writes.\n` +
+                          `Question: Can we get r0=0 AND r1=0 simultaneously?\n\n` +
+                          `Under SC: NO (forbidden)\n` +
+                          `Under TSO: YES (allowed due to store buffering)\n\n` +
+                          `Click a button to run test.`;
+        return true;
+    } catch (e) {
+        output.innerHTML = `<span class="error">❌ Error:</span> ${e.message}`;
+        console.error(e);
+        return false;
+    }
+}
+
+async function runTest(iterations) {
+    if (!device) {
+        const ok = await init();
+        if (!ok) return;
+    }
+    
+    output.textContent = `Running ${iterations} iterations...`;
+    const startTime = performance.now();
+    
+    try {
+        const module = device.createShaderModule({ code: shaderCode });
+        const pipeline = device.createComputePipeline({
+            layout: 'auto',
+            compute: { module, entryPoint: 'main' }
+        });
+        
+        const resultBuffer = device.createBuffer({
+            size: 8,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+        });
+        
+        const readBuffer = device.createBuffer({
+            size: 8,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+        });
+        
+        const bindGroup = device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [{ binding: 0, resource: { buffer: resultBuffer } }]
+        });
+        
+        let outcomes = {
+            '0,0': 0,  // Both missed - SC forbids, TSO allows
+            '0,1': 0,  // T0 missed, T1 saw
+            '1,0': 0,  // T0 saw, T1 missed
+            '1,1': 0   // Both saw
+        };
+        
+        for (let i = 0; i < iterations; i++) {
+            const encoder = device.createCommandEncoder();
+            const pass = encoder.beginComputePass();
+            pass.setPipeline(pipeline);
+            pass.setBindGroup(0, bindGroup);
+            pass.dispatchWorkgroups(1);
+            pass.end();
+            encoder.copyBufferToBuffer(resultBuffer, 0, readBuffer, 0, 8);
+            device.queue.submit([encoder.finish()]);
+            
+            await readBuffer.mapAsync(GPUMapMode.READ);
+            const results = new Uint32Array(readBuffer.getMappedRange());
+            const r0 = results[0];
+            const r1 = results[1];
+            readBuffer.unmap();
+            
+            const key = `${r0},${r1}`;
+            if (outcomes[key] !== undefined) {
+                outcomes[key]++;
+            }
+            
+            if (i % 500 === 0 && i > 0) {
+                output.textContent = `Progress: ${i}/${iterations} (${((i/iterations)*100).toFixed(0)}%)`;
+            }
+        }
+        
+        const elapsed = ((performance.now() - startTime) / 1000).toFixed(2);
+        const bothZero = outcomes['0,0'];
+        const bothZeroPct = (bothZero/iterations*100).toFixed(2);
+        
+        output.innerHTML = `<span class="success">✅ Test Complete!</span>\n\n` +
+                          `Machine: NVIDIA RTX 3090 (Ubuntu)\n` +
+                          `Test: Store Buffering\n` +
+                          `Iterations: ${iterations}\n` +
+                          `Time: ${elapsed}s\n\n` +
+                          `OUTCOMES:\n` +
+                          `  (r0=0, r1=0): ${outcomes['0,0'].toString().padStart(6)} (${bothZeroPct}%) ← KEY RESULT\n` +
+                          `  (r0=0, r1=1): ${outcomes['0,1'].toString().padStart(6)} (${(outcomes['0,1']/iterations*100).toFixed(2)}%)\n` +
+                          `  (r0=1, r1=0): ${outcomes['1,0'].toString().padStart(6)} (${(outcomes['1,0']/iterations*100).toFixed(2)}%)\n` +
+                          `  (r0=1, r1=1): ${outcomes['1,1'].toString().padStart(6)} (${(outcomes['1,1']/iterations*100).toFixed(2)}%)\n\n` +
+                          `INTERPRETATION:\n` +
+                          `${bothZero > 0 ? 
+                            `🔥 RELAXED MEMORY DETECTED!\n   Both threads missed each other's writes ${bothZeroPct}% of the time.\n   This is FORBIDDEN under SC but ALLOWED under TSO/relaxed models.\n   NVIDIA GPU exhibits non-SC behavior!` : 
+                            '✓ SC behavior: Never observed (r0=0, r1=0).\n   GPU maintains sequential consistency for this test.'}`;
+        
+        console.log('Detailed outcomes:', outcomes);
+        
+    } catch (e) {
+        output.innerHTML = `<span class="error">❌ Error:</span>\n${e.message}`;
+        console.error('Full error:', e);
+    }
+}
+
+window.addEventListener('load', init);
+</script>
+</body>
+</html>
