@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Non-Atomic Debug Test - FIXED</title>
+    <title>Non-Atomic Debug - With Error Checking</title>
     <style>
         body { font-family: monospace; padding: 20px; }
         #output { white-space: pre-wrap; background: #f0f0f0; padding: 15px; }
@@ -9,7 +9,7 @@
     </style>
 </head>
 <body>
-    <h1>Non-Atomic Debug Test (Fixed)</h1>
+    <h1>Non-Atomic Debug (Error Checking)</h1>
     <button onclick="runTest()">Run Test</button>
     <div id="output">Click to run...</div>
 
@@ -24,22 +24,20 @@ fn main(@builtin(local_invocation_index) idx: u32) {
     if (idx == 0u) {
         test_var = 0u;
     }
-    workgroupBarrier();  // All threads wait
+    workgroupBarrier();
     
-    // Thread 0: Write 42
     if (idx == 0u) {
         test_var = 42u;
-        results[0] = 888u;  // Proof T0 ran
+        results[0] = 888u;
     }
     
-    workgroupBarrier();  // BOTH threads wait here!
+    workgroupBarrier();
     
-    // Thread 1: Read after T0 has written
     if (idx == 1u) {
-        results[1] = test_var;  // What do we see?
+        results[1] = test_var;
     }
     
-    workgroupBarrier();  // Final sync
+    workgroupBarrier();
 }
 `;
 
@@ -47,20 +45,49 @@ let device = null;
 const output = document.getElementById('output');
 
 async function runTest() {
-    if (!device) {
-        const adapter = await navigator.gpu.requestAdapter();
-        device = await adapter.requestDevice();
-    }
-    
-    output.textContent = 'Running debug test...';
+    output.textContent = 'Initializing...';
     
     try {
-        const module = device.createShaderModule({ code: shaderCode });
+        if (!device) {
+            if (!navigator.gpu) {
+                output.textContent = '❌ WebGPU not supported';
+                return;
+            }
+            
+            const adapter = await navigator.gpu.requestAdapter();
+            if (!adapter) {
+                output.textContent = '❌ No GPU adapter';
+                return;
+            }
+            
+            device = await adapter.requestDevice();
+            output.textContent = '✓ Device acquired\n';
+        }
+        
+        output.textContent += 'Compiling shader...\n';
+        const module = device.createShaderModule({ 
+            code: shaderCode,
+            compilationHints: [{
+                entryPoint: 'main'
+            }]
+        });
+        
+        // Check for compilation errors
+        const compilationInfo = await module.getCompilationInfo();
+        if (compilationInfo.messages.length > 0) {
+            output.textContent += '\n⚠️ Shader compilation messages:\n';
+            for (const msg of compilationInfo.messages) {
+                output.textContent += `${msg.type}: ${msg.message}\n`;
+            }
+        }
+        
+        output.textContent += 'Creating pipeline...\n';
         const pipeline = device.createComputePipeline({
             layout: 'auto',
             compute: { module, entryPoint: 'main' }
         });
         
+        output.textContent += 'Creating buffers...\n';
         const resultBuffer = device.createBuffer({
             size: 8,
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
@@ -71,11 +98,13 @@ async function runTest() {
             usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
         });
         
+        output.textContent += 'Creating bind group...\n';
         const bindGroup = device.createBindGroup({
             layout: pipeline.getBindGroupLayout(0),
             entries: [{ binding: 0, resource: { buffer: resultBuffer } }]
         });
         
+        output.textContent += 'Encoding commands...\n';
         const encoder = device.createCommandEncoder();
         const pass = encoder.beginComputePass();
         pass.setPipeline(pipeline);
@@ -83,28 +112,27 @@ async function runTest() {
         pass.dispatchWorkgroups(1);
         pass.end();
         encoder.copyBufferToBuffer(resultBuffer, 0, readBuffer, 0, 8);
+        
+        output.textContent += 'Submitting to GPU...\n';
         device.queue.submit([encoder.finish()]);
         
+        output.textContent += 'Waiting for results...\n';
         await readBuffer.mapAsync(GPUMapMode.READ);
         const results = new Uint32Array(readBuffer.getMappedRange());
+        
+        output.textContent += '\n✓ EXECUTION COMPLETE\n\n';
+        output.textContent += `results[0]: ${results[0]}\n`;
+        output.textContent += `results[1]: ${results[1]}\n\n`;
+        
+        output.textContent += `Thread 0 ${results[0] === 888 ? 'RAN' : 'DID NOT RUN'}\n`;
+        output.textContent += `Thread 1 saw: ${results[1]}\n`;
+        
         readBuffer.unmap();
         
-        output.textContent = `DEBUG RESULTS:\n\n` +
-                            `results[0] (Thread 0 marker): ${results[0]}\n` +
-                            `results[1] (Thread 1 read):   ${results[1]}\n\n` +
-                            `ANALYSIS:\n` +
-                            `${results[0] === 888 ? '✓ Thread 0 executed' : '✗ Thread 0 did not execute'}\n` +
-                            `${results[1] === 42 ? '✓ Thread 1 saw T0 write WITH barrier' : 
-                              results[1] === 0 ? '⚠️ Thread 1 saw 0 despite barrier' :
-                              `? Thread 1 saw ${results[1]}`}\n\n` +
-                            `CONCLUSION:\n` +
-                            `${results[1] === 42 ? 
-                              'Non-atomics WORK with explicit barriers between operations.' :
-                              'Non-atomics FAIL even with barriers - need atomics!'}`;
-        
     } catch (e) {
-        output.textContent = `❌ Error: ${e.message}`;
-        console.error(e);
+        output.textContent += `\n❌ ERROR: ${e.message}\n`;
+        output.textContent += `Stack: ${e.stack}\n`;
+        console.error('Full error:', e);
     }
 }
 </script>
