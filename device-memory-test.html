@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Device Memory Test - Apple M2 Ultra</title>
+    <style>
+        body { font-family: monospace; padding: 20px; max-width: 900px; }
+        #output { white-space: pre-wrap; background: #f0f0f0; padding: 15px; 
+                  border-radius: 5px; margin: 10px 0; }
+        button { padding: 12px 24px; font-size: 16px; cursor: pointer; margin: 5px; }
+    </style>
+</head>
+<body>
+    <h1>Device Memory Store Buffering - Apple M2 Ultra</h1>
+    <button onclick="runTest(1000)">Quick Test (1K)</button>
+    <button onclick="runTest(10000)">Full Test (10K)</button>
+    <div id="output">Click button to run...</div>
+
+<script>
+const shaderCode = `
+@group(0) @binding(0) var<storage, read_write> x: atomic<u32>;
+@group(0) @binding(1) var<storage, read_write> y: atomic<u32>;
+@group(0) @binding(2) var<storage, read_write> results: array<u32>;
+
+@compute @workgroup_size(1, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    // Workgroup 0: Write x, read y
+    if (gid.x == 0u) {
+        atomicStore(&x, 1u);
+        results[0] = atomicLoad(&y);
+    }
+    
+    // Workgroup 1: Write y, read x
+    if (gid.x == 1u) {
+        atomicStore(&y, 1u);
+        results[1] = atomicLoad(&x);
+    }
+}
+`;
+
+let device = null;
+let adapter = null;
+const output = document.getElementById('output');
+
+async function init() {
+    if (!navigator.gpu) {
+        output.textContent = '❌ WebGPU not supported';
+        return false;
+    }
+    
+    try {
+        adapter = await navigator.gpu.requestAdapter();
+        device = await adapter.requestDevice();
+        return true;
+    } catch (e) {
+        output.textContent = `❌ Error: ${e.message}`;
+        return false;
+    }
+}
+
+async function runTest(iterations) {
+    if (!device) await init();
+    
+    output.textContent = `Running ${iterations} iterations on Apple M2 Ultra...\nUsing DEVICE MEMORY (storage buffers across workgroups)`;
+    const startTime = performance.now();
+    
+    try {
+        const module = device.createShaderModule({ code: shaderCode });
+        const pipeline = device.createComputePipeline({
+            layout: 'auto',
+            compute: { module, entryPoint: 'main' }
+        });
+        
+        const xBuffer = device.createBuffer({
+            size: 4,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+        });
+        
+        const yBuffer = device.createBuffer({
+            size: 4,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+        });
+        
+        const resultBuffer = device.createBuffer({
+            size: 8,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+        });
+        
+        const readBuffer = device.createBuffer({
+            size: 8,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+        });
+        
+        const bindGroup = device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: xBuffer } },
+                { binding: 1, resource: { buffer: yBuffer } },
+                { binding: 2, resource: { buffer: resultBuffer } }
+            ]
+        });
+        
+        const zero = new Uint32Array([0]);
+        let outcomes = {
+            '0,0': 0,
+            '0,1': 0,
+            '1,0': 0,
+            '1,1': 0
+        };
+        
+        for (let i = 0; i < iterations; i++) {
+            // Reset to 0
+            device.queue.writeBuffer(xBuffer, 0, zero);
+            device.queue.writeBuffer(yBuffer, 0, zero);
+            
+            const encoder = device.createCommandEncoder();
+            const pass = encoder.beginComputePass();
+            pass.setPipeline(pipeline);
+            pass.setBindGroup(0, bindGroup);
+            pass.dispatchWorkgroups(2);  // 2 separate workgroups!
+            pass.end();
+            encoder.copyBufferToBuffer(resultBuffer, 0, readBuffer, 0, 8);
+            device.queue.submit([encoder.finish()]);
+            
+            await readBuffer.mapAsync(GPUMapMode.READ);
+            const results = new Uint32Array(readBuffer.getMappedRange());
+            const r0 = results[0];
+            const r1 = results[1];
+            readBuffer.unmap();
+            
+            const key = `${r0},${r1}`;
+            outcomes[key]++;
+            
+            if (i % 500 === 0 && i > 0) {
+                output.textContent = `Progress: ${i}/${iterations}`;
+            }
+        }
+        
+        const elapsed = ((performance.now() - startTime) / 1000).toFixed(2);
+        
+        output.textContent = `✅ DEVICE MEMORY TEST COMPLETE\n\n` +
+                            `Apple M2 Ultra\n` +
+                            `Iterations: ${iterations}\n` +
+                            `Time: ${elapsed}s\n\n` +
+                            `OUTCOMES:\n` +
+                            `  (0,0): ${outcomes['0,0'].toString().padStart(5)} (${(outcomes['0,0']/iterations*100).toFixed(2)}%)\n` +
+                            `  (0,1): ${outcomes['0,1'].toString().padStart(5)} (${(outcomes['0,1']/iterations*100).toFixed(2)}%)\n` +
+                            `  (1,0): ${outcomes['1,0'].toString().padStart(5)} (${(outcomes['1,0']/iterations*100).toFixed(2)}%)\n` +
+                            `  (1,1): ${outcomes['1,1'].toString().padStart(5)} (${(outcomes['1,1']/iterations*100).toFixed(2)}%)\n\n` +
+                            `ANALYSIS:\n` +
+                            `${outcomes['0,0'] > 0 ? 
+                              `🔥🔥🔥 RELAXED BEHAVIOR DETECTED!\n(0,0) occurred ${outcomes['0,0']} times!\nBoth workgroups missed each other's writes.\nThis is FORBIDDEN under SC but ALLOWED under relaxed models!` :
+                              outcomes['1,1'] > 0 ?
+                              `Strong ordering: Both saw each other ${(outcomes['1,1']/iterations*100).toFixed(2)}% of time` :
+                              `Deterministic ordering observed`}`;
+        
+        console.log('Full results:', outcomes);
+        
+    } catch (e) {
+        output.textContent = `❌ Error: ${e.message}\n\nStack: ${e.stack}`;
+        console.error(e);
+    }
+}
+
+window.addEventListener('load', init);
+</script>
+</body>
+</html>

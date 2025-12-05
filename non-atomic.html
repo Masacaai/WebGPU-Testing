@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Non-Atomic Test - Apple M2 Ultra</title>
+    <style>
+        body { font-family: monospace; padding: 20px; }
+        #output { white-space: pre-wrap; background: #f0f0f0; padding: 15px; }
+        button { padding: 12px 24px; font-size: 16px; margin: 5px; }
+    </style>
+</head>
+<body>
+    <h1>Non-Atomic Variables Test</h1>
+    <button onclick="runTest(10000)">Run 10K iterations</button>
+    <div id="output">Click to run...</div>
+
+<script>
+const shaderCode = `
+@group(0) @binding(0) var<storage, read_write> results: array<u32>;
+
+var<workgroup> data: u32;  // NON-ATOMIC!
+var<workgroup> flag: u32;  // NON-ATOMIC!
+
+@compute @workgroup_size(2, 1, 1)
+fn main(@builtin(local_invocation_index) idx: u32) {
+    if (idx == 0u) {
+        data = 0u;
+        flag = 0u;
+    }
+    workgroupBarrier();
+    
+    if (idx == 0u) {
+        data = 42u;
+        flag = 1u;
+    }
+    
+    if (idx == 1u) {
+        var r = 999u;
+        for (var i = 0u; i < 100000u; i = i + 1u) {
+            if (flag == 1u) {
+                r = data;
+                break;
+            }
+        }
+        results[1u] = r;
+    }
+    
+    workgroupBarrier();
+}
+`;
+
+let device = null;
+const output = document.getElementById('output');
+
+async function runTest(iterations) {
+    if (!device) {
+        const adapter = await navigator.gpu.requestAdapter();
+        device = await adapter.requestDevice();
+    }
+    
+    output.textContent = `Running ${iterations} iterations with NON-ATOMIC variables...`;
+    const startTime = performance.now();
+    
+    try {
+        const module = device.createShaderModule({ code: shaderCode });
+        const pipeline = device.createComputePipeline({
+            layout: 'auto',
+            compute: { module, entryPoint: 'main' }
+        });
+        
+        const resultBuffer = device.createBuffer({
+            size: 8,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+        });
+        
+        const readBuffer = device.createBuffer({
+            size: 8,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+        });
+        
+        const bindGroup = device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [{ binding: 0, resource: { buffer: resultBuffer } }]
+        });
+        
+        let outcomes = { '42': 0, '0': 0, '999': 0, 'other': 0 };
+        
+        for (let i = 0; i < iterations; i++) {
+            const encoder = device.createCommandEncoder();
+            const pass = encoder.beginComputePass();
+            pass.setPipeline(pipeline);
+            pass.setBindGroup(0, bindGroup);
+            pass.dispatchWorkgroups(1);
+            pass.end();
+            encoder.copyBufferToBuffer(resultBuffer, 0, readBuffer, 0, 8);
+            device.queue.submit([encoder.finish()]);
+            
+            await readBuffer.mapAsync(GPUMapMode.READ);
+            const result = new Uint32Array(readBuffer.getMappedRange())[1];
+            readBuffer.unmap();
+            
+            if (result === 42) outcomes['42']++;
+            else if (result === 0) outcomes['0']++;
+            else if (result === 999) outcomes['999']++;
+            else outcomes['other']++;
+        }
+        
+        const elapsed = ((performance.now() - startTime) / 1000).toFixed(2);
+        
+        output.textContent = `✅ NON-ATOMIC TEST COMPLETE\n\n` +
+                            `Apple M2 Ultra\n` +
+                            `Iterations: ${iterations}\n` +
+                            `Time: ${elapsed}s\n\n` +
+                            `RESULTS:\n` +
+                            `  r=42:  ${outcomes['42']} (${(outcomes['42']/iterations*100).toFixed(2)}%)\n` +
+                            `  r=0:   ${outcomes['0']} (${(outcomes['0']/iterations*100).toFixed(2)}%)\n` +
+                            `  r=999: ${outcomes['999']} (${(outcomes['999']/iterations*100).toFixed(2)}%)\n\n` +
+                            `${outcomes['0'] > 0 ? 
+                              '🔥 Non-atomics show reordering!' : 
+                              '✓ Non-atomics still maintain order'}`;
+        
+    } catch (e) {
+        output.textContent = `❌ Error: ${e.message}`;
+        console.error(e);
+    }
+}
+</script>
+</body>
+</html>
