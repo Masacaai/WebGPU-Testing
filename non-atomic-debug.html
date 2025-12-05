@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Non-Atomic Debug Test</title>
+    <style>
+        body { font-family: monospace; padding: 20px; }
+        #output { white-space: pre-wrap; background: #f0f0f0; padding: 15px; }
+        button { padding: 12px; font-size: 16px; margin: 5px; }
+    </style>
+</head>
+<body>
+    <h1>Non-Atomic Debug Test</h1>
+    <button onclick="runTest()">Run Test</button>
+    <div id="output">Click to run...</div>
+
+<script>
+const shaderCode = `
+@group(0) @binding(0) var<storage, read_write> results: array<u32>;
+
+var<workgroup> test_var: u32;
+
+@compute @workgroup_size(2, 1, 1)
+fn main(@builtin(local_invocation_index) idx: u32) {
+    if (idx == 0u) {
+        test_var = 0u;
+    }
+    workgroupBarrier();
+    
+    // Thread 0: Write 42
+    if (idx == 0u) {
+        test_var = 42u;
+        results[0] = 888u;  // Proof T0 ran
+    }
+    
+    // Thread 1: Read immediately after barrier
+    if (idx == 1u) {
+        workgroupBarrier();  // Wait for T0 to write
+        results[1] = test_var;  // What do we see?
+    }
+}
+`;
+
+let device = null;
+const output = document.getElementById('output');
+
+async function runTest() {
+    if (!device) {
+        const adapter = await navigator.gpu.requestAdapter();
+        device = await adapter.requestDevice();
+    }
+    
+    output.textContent = 'Running debug test...';
+    
+    try {
+        const module = device.createShaderModule({ code: shaderCode });
+        const pipeline = device.createComputePipeline({
+            layout: 'auto',
+            compute: { module, entryPoint: 'main' }
+        });
+        
+        const resultBuffer = device.createBuffer({
+            size: 8,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+        });
+        
+        const readBuffer = device.createBuffer({
+            size: 8,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+        });
+        
+        const bindGroup = device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [{ binding: 0, resource: { buffer: resultBuffer } }]
+        });
+        
+        const encoder = device.createCommandEncoder();
+        const pass = encoder.beginComputePass();
+        pass.setPipeline(pipeline);
+        pass.setBindGroup(0, bindGroup);
+        pass.dispatchWorkgroups(1);
+        pass.end();
+        encoder.copyBufferToBuffer(resultBuffer, 0, readBuffer, 0, 8);
+        device.queue.submit([encoder.finish()]);
+        
+        await readBuffer.mapAsync(GPUMapMode.READ);
+        const results = new Uint32Array(readBuffer.getMappedRange());
+        readBuffer.unmap();
+        
+        output.textContent = `DEBUG RESULTS:\n\n` +
+                            `results[0] (Thread 0 marker): ${results[0]}\n` +
+                            `results[1] (Thread 1 read):   ${results[1]}\n\n` +
+                            `ANALYSIS:\n` +
+                            `${results[0] === 888 ? '✓ Thread 0 executed' : '✗ Thread 0 did not execute'}\n` +
+                            `${results[1] === 42 ? '✓ Thread 1 saw T0 write (with barrier)' : 
+                              results[1] === 0 ? '✗ Thread 1 saw 0 (initialization value)' :
+                              `? Thread 1 saw ${results[1]} (unexpected)`}`;
+        
+    } catch (e) {
+        output.textContent = `❌ Error: ${e.message}`;
+        console.error(e);
+    }
+}
+</script>
+</body>
+</html>
