@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Non-Atomic Device Memory Test</title>
+    <style>
+        body { font-family: monospace; padding: 20px; }
+        #output { white-space: pre-wrap; background: #f0f0f0; padding: 15px; }
+        button { padding: 12px; font-size: 16px; margin: 5px; }
+    </style>
+</head>
+<body>
+    <h1>Non-Atomic Device Memory Test - Apple M2</h1>
+    <button onclick="runTest(1000)">Run 1K iterations</button>
+    <div id="output">Click to run...</div>
+
+<script>
+const shaderCode = `
+@group(0) @binding(0) var<storage, read_write> data: u32;      // Non-atomic!
+@group(0) @binding(1) var<storage, read_write> flag: u32;      // Non-atomic!
+@group(0) @binding(2) var<storage, read_write> results: array<u32>;
+
+@compute @workgroup_size(1, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    // Workgroup 0: Sender
+    if (gid.x == 0u) {
+        data = 42u;
+        flag = 1u;
+        results[0] = 888u;  // Marker that T0 ran
+    }
+    
+    // Workgroup 1: Receiver (poll for flag)
+    if (gid.x == 1u) {
+        var r = 999u;
+        for (var i = 0u; i < 100000u; i = i + 1u) {
+            if (flag == 1u) {
+                r = data;
+                break;
+            }
+        }
+        results[1] = r;
+    }
+}
+`;
+
+let device = null;
+const output = document.getElementById('output');
+
+async function runTest(iterations) {
+    if (!device) {
+        const adapter = await navigator.gpu.requestAdapter();
+        device = await adapter.requestDevice();
+    }
+    
+    output.textContent = `Running ${iterations} iterations with NON-ATOMIC device memory...`;
+    const startTime = performance.now();
+    
+    try {
+        const module = device.createShaderModule({ code: shaderCode });
+        const pipeline = device.createComputePipeline({
+            layout: 'auto',
+            compute: { module, entryPoint: 'main' }
+        });
+        
+        // Device memory buffers (non-atomic u32)
+        const dataBuffer = device.createBuffer({
+            size: 4,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+        });
+        
+        const flagBuffer = device.createBuffer({
+            size: 4,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+        });
+        
+        const resultBuffer = device.createBuffer({
+            size: 8,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+        });
+        
+        const readBuffer = device.createBuffer({
+            size: 8,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+        });
+        
+        const bindGroup = device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: dataBuffer } },
+                { binding: 1, resource: { buffer: flagBuffer } },
+                { binding: 2, resource: { buffer: resultBuffer } }
+            ]
+        });
+        
+        const zero = new Uint32Array([0]);
+        let outcomes = { '42': 0, '0': 0, '999': 0, 'other': 0 };
+        
+        for (let i = 0; i < iterations; i++) {
+            // Reset to 0
+            device.queue.writeBuffer(dataBuffer, 0, zero);
+            device.queue.writeBuffer(flagBuffer, 0, zero);
+            
+            const encoder = device.createCommandEncoder();
+            const pass = encoder.beginComputePass();
+            pass.setPipeline(pipeline);
+            pass.setBindGroup(0, bindGroup);
+            pass.dispatchWorkgroups(2);  // 2 workgroups
+            pass.end();
+            encoder.copyBufferToBuffer(resultBuffer, 0, readBuffer, 0, 8);
+            device.queue.submit([encoder.finish()]);
+            
+            await readBuffer.mapAsync(GPUMapMode.READ);
+            const results = new Uint32Array(readBuffer.getMappedRange());
+            const r = results[1];
+            readBuffer.unmap();
+            
+            if (r === 42) outcomes['42']++;
+            else if (r === 0) outcomes['0']++;
+            else if (r === 999) outcomes['999']++;
+            else outcomes['other']++;
+            
+            if (i % 200 === 0 && i > 0) {
+                output.textContent = `Progress: ${i}/${iterations}`;
+            }
+        }
+        
+        const elapsed = ((performance.now() - startTime) / 1000).toFixed(2);
+        
+        output.textContent = `✅ NON-ATOMIC DEVICE MEMORY TEST\n\n` +
+                            `Apple M2 Ultra\n` +
+                            `Memory: DEVICE (storage buffers, non-atomic)\n` +
+                            `Iterations: ${iterations}\n` +
+                            `Time: ${elapsed}s\n\n` +
+                            `RESULTS:\n` +
+                            `  r=42:  ${outcomes['42']} (${(outcomes['42']/iterations*100).toFixed(2)}%)\n` +
+                            `  r=0:   ${outcomes['0']} (${(outcomes['0']/iterations*100).toFixed(2)}%)\n` +
+                            `  r=999: ${outcomes['999']} (${(outcomes['999']/iterations*100).toFixed(2)}%)\n\n` +
+                            `COMPARISON:\n` +
+                            `Workgroup non-atomic: 100% timeout (compiler optimization)\n` +
+                            `Device non-atomic:    ${outcomes['999'] === iterations ? '100% timeout (same issue)' : 
+                                                     outcomes['42'] > 0 ? `${(outcomes['42']/iterations*100).toFixed(1)}% success (works!)` :
+                                                     'Mixed results'}\n\n` +
+                            `${outcomes['999'] === iterations ? 
+                              '⚠️ Same compiler optimization issue in device memory.\nPolling non-atomics does not work.' :
+                              outcomes['42'] > 0 ?
+                              '🔥 Non-atomics work in device memory without explicit barriers!\nDifferent from workgroup behavior!' :
+                              ''}`;
+        
+    } catch (e) {
+        output.textContent = `❌ Error: ${e.message}`;
+        console.error(e);
+    }
+}
+</script>
+</body>
+</html>
