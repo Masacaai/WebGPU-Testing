@@ -26,16 +26,16 @@ var<workgroup> flag: atomic<u32>;
 
 @compute @workgroup_size(2, 1, 1)
 fn main(@builtin(local_invocation_index) idx: u32) {
-    // Initialize (only thread 0)
+    // Initialize both vars
     if (idx == 0u) {
         atomicStore(&data, 0u);
         atomicStore(&flag, 0u);
     }
     
-    // Wait for initialization to complete
+    // Fence to ensure initialization completes
     workgroupBarrier();
     
-    // Thread 0: Sender - write data then flag (NO barrier between!)
+    // Thread 0: Sender - write data then flag 
     if (idx == 0u) {
         atomicStore(&data, 42u);
         atomicStore(&flag, 1u);
@@ -43,23 +43,15 @@ fn main(@builtin(local_invocation_index) idx: u32) {
     
     // Thread 1: Receiver - wait for flag, then read data
     if (idx == 1u) {
-        // Busy-wait for flag
-        var saw_flag = false;
+        var r = 999u; // Default to timeout
         for (var i = 0u; i < 100000u; i = i + 1u) {
             if (atomicLoad(&flag) == 1u) {
-                saw_flag = true;
+                r = atomicLoad(&data);
                 break;
             }
         }
-        
-        var r = 0u;
-        if (saw_flag) {
-            r = atomicLoad(&data);
-        } else {
-            r = 999u; // timeout
-        }
-        
-        results[idx] = r;
+                
+        results[1u] = r;
     }
     
     // Final barrier to ensure both threads complete

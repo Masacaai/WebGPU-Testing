@@ -41,9 +41,8 @@ fn main(@builtin(local_invocation_index) idx: u32) {
     }
     
     if (idx == 1u) {
-        let r1 = atomicLoad(&y);
-        let r2 = atomicLoad(&x);
-        results[1] = (r1 << 16u) | r2;  // Pack both reads
+        results[0] = atomicLoad(&y);
+        results[1] = atomicLoad(&x);
     }
     
     if (idx == 2u) {
@@ -52,9 +51,8 @@ fn main(@builtin(local_invocation_index) idx: u32) {
     }
     
     if (idx == 3u) {
-        let r3 = atomicLoad(&w);
-        let r4 = atomicLoad(&z);
-        results[3] = (r3 << 16u) | r4;  // Pack both reads
+        results[2] = atomicLoad(&w);
+        results[3] = atomicLoad(&z);
     }
     
     workgroupBarrier();

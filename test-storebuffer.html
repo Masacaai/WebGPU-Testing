@@ -36,15 +36,13 @@ fn main(@builtin(local_invocation_index) idx: u32) {
     // Thread 0: Write x=1, read y
     if (idx == 0u) {
         atomicStore(&x, 1u);
-        let r0 = atomicLoad(&y);
-        results[0] = r0;
+        results[0] = atomicLoad(&y);
     }
     
     // Thread 1: Write y=1, read x
     if (idx == 1u) {
         atomicStore(&y, 1u);
-        let r1 = atomicLoad(&x);
-        results[1] = r1;
+        results[1] = atomicLoad(&x);
     }
     
     workgroupBarrier();
