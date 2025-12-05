@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Non-Atomic Test - Apple M2 Ultra</title>
+    <title>Non-Atomic Test v2 - Apple M2 Ultra</title>
     <style>
         body { font-family: monospace; padding: 20px; }
         #output { white-space: pre-wrap; background: #f0f0f0; padding: 15px; }
@@ -9,16 +9,16 @@
     </style>
 </head>
 <body>
-    <h1>Non-Atomic Variables Test</h1>
-    <button onclick="runTest(10000)">Run 10K iterations</button>
+    <h1>Non-Atomic Test v2 - With Extra Barrier</h1>
+    <button onclick="runTest(1000)">Run 1K iterations</button>
     <div id="output">Click to run...</div>
 
 <script>
 const shaderCode = `
 @group(0) @binding(0) var<storage, read_write> results: array<u32>;
 
-var<workgroup> data: u32;  // NON-ATOMIC!
-var<workgroup> flag: u32;  // NON-ATOMIC!
+var<workgroup> data: u32;
+var<workgroup> flag: u32;
 
 @compute @workgroup_size(2, 1, 1)
 fn main(@builtin(local_invocation_index) idx: u32) {
@@ -30,10 +30,21 @@ fn main(@builtin(local_invocation_index) idx: u32) {
     
     if (idx == 0u) {
         data = 42u;
+        // Add small delay to ensure write completes
+        var dummy = 0u;
+        for (var i = 0u; i < 1000u; i = i + 1u) {
+            dummy += i;
+        }
         flag = 1u;
     }
     
     if (idx == 1u) {
+        // Also add delay before checking
+        var dummy = 0u;
+        for (var i = 0u; i < 1000u; i = i + 1u) {
+            dummy += i;
+        }
+        
         var r = 999u;
         for (var i = 0u; i < 100000u; i = i + 1u) {
             if (flag == 1u) {
@@ -57,7 +68,7 @@ async function runTest(iterations) {
         device = await adapter.requestDevice();
     }
     
-    output.textContent = `Running ${iterations} iterations with NON-ATOMIC variables...`;
+    output.textContent = `Running ${iterations} iterations...`;
     const startTime = performance.now();
     
     try {
@@ -106,17 +117,17 @@ async function runTest(iterations) {
         
         const elapsed = ((performance.now() - startTime) / 1000).toFixed(2);
         
-        output.textContent = `✅ NON-ATOMIC TEST COMPLETE\n\n` +
-                            `Apple M2 Ultra\n` +
+        output.textContent = `✅ TEST COMPLETE\n\n` +
                             `Iterations: ${iterations}\n` +
                             `Time: ${elapsed}s\n\n` +
-                            `RESULTS:\n` +
                             `  r=42:  ${outcomes['42']} (${(outcomes['42']/iterations*100).toFixed(2)}%)\n` +
                             `  r=0:   ${outcomes['0']} (${(outcomes['0']/iterations*100).toFixed(2)}%)\n` +
                             `  r=999: ${outcomes['999']} (${(outcomes['999']/iterations*100).toFixed(2)}%)\n\n` +
-                            `${outcomes['0'] > 0 ? 
-                              '🔥 Non-atomics show reordering!' : 
-                              '✓ Non-atomics still maintain order'}`;
+                            `${outcomes['999'] === iterations ? 
+                              '⚠️ Still timing out - non-atomics may not synchronize at all!' :
+                              outcomes['0'] > 0 ? 
+                              '🔥 Reordering detected!' : 
+                              '✓ Works with delays'}`;
         
     } catch (e) {
         output.textContent = `❌ Error: ${e.message}`;
