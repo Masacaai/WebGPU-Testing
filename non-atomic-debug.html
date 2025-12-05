@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Non-Atomic Debug Test</title>
+    <title>Non-Atomic Debug Test - FIXED</title>
     <style>
         body { font-family: monospace; padding: 20px; }
         #output { white-space: pre-wrap; background: #f0f0f0; padding: 15px; }
@@ -9,7 +9,7 @@
     </style>
 </head>
 <body>
-    <h1>Non-Atomic Debug Test</h1>
+    <h1>Non-Atomic Debug Test (Fixed)</h1>
     <button onclick="runTest()">Run Test</button>
     <div id="output">Click to run...</div>
 
@@ -24,7 +24,7 @@ fn main(@builtin(local_invocation_index) idx: u32) {
     if (idx == 0u) {
         test_var = 0u;
     }
-    workgroupBarrier();
+    workgroupBarrier();  // All threads wait
     
     // Thread 0: Write 42
     if (idx == 0u) {
@@ -32,11 +32,14 @@ fn main(@builtin(local_invocation_index) idx: u32) {
         results[0] = 888u;  // Proof T0 ran
     }
     
-    // Thread 1: Read immediately after barrier
+    workgroupBarrier();  // BOTH threads wait here!
+    
+    // Thread 1: Read after T0 has written
     if (idx == 1u) {
-        workgroupBarrier();  // Wait for T0 to write
         results[1] = test_var;  // What do we see?
     }
+    
+    workgroupBarrier();  // Final sync
 }
 `;
 
@@ -91,9 +94,13 @@ async function runTest() {
                             `results[1] (Thread 1 read):   ${results[1]}\n\n` +
                             `ANALYSIS:\n` +
                             `${results[0] === 888 ? '✓ Thread 0 executed' : '✗ Thread 0 did not execute'}\n` +
-                            `${results[1] === 42 ? '✓ Thread 1 saw T0 write (with barrier)' : 
-                              results[1] === 0 ? '✗ Thread 1 saw 0 (initialization value)' :
-                              `? Thread 1 saw ${results[1]} (unexpected)`}`;
+                            `${results[1] === 42 ? '✓ Thread 1 saw T0 write WITH barrier' : 
+                              results[1] === 0 ? '⚠️ Thread 1 saw 0 despite barrier' :
+                              `? Thread 1 saw ${results[1]}`}\n\n` +
+                            `CONCLUSION:\n` +
+                            `${results[1] === 42 ? 
+                              'Non-atomics WORK with explicit barriers between operations.' :
+                              'Non-atomics FAIL even with barriers - need atomics!'}`;
         
     } catch (e) {
         output.textContent = `❌ Error: ${e.message}`;
