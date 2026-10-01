@@ -12,7 +12,7 @@
     </style>
 </head>
 <body>
-    <h1>Store Buffering Test - NVIDIA RTX 3090</h1>
+    <h1>Store Buffering Test - NVIDIA RTX 4090</h1>
     <button onclick="runTest(1000)">Run 1K iterations</button>
     <button onclick="runTest(10000)">Run 10K iterations</button>
     <div id="output">Initializing...</div>
@@ -71,7 +71,7 @@ async function init() {
         device = await adapter.requestDevice();
         
         output.innerHTML = `<span class="success">✅ WebGPU Ready!</span>\n\n` +
-                          `GPU: NVIDIA RTX 3090\n` +
+                          `GPU: NVIDIA RTX 4090\n` +
                           `Test: Store Buffering\n\n` +
                           `This test checks if both threads can miss each other's writes.\n` +
                           `Question: Can we get r0=0 AND r1=0 simultaneously?\n\n` +
@@ -155,7 +155,7 @@ async function runTest(iterations) {
         const bothZeroPct = (bothZero/iterations*100).toFixed(2);
         
         output.innerHTML = `<span class="success">✅ Test Complete!</span>\n\n` +
-                          `Machine: NVIDIA RTX 3090 (Ubuntu)\n` +
+                          `Machine: NVIDIA RTX 4090 (Ubuntu)\n` +
                           `Test: Store Buffering\n` +
                           `Iterations: ${iterations}\n` +
                           `Time: ${elapsed}s\n\n` +

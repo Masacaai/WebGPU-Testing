@@ -71,7 +71,7 @@ async function init() {
     try {
         const adapter = await navigator.gpu.requestAdapter();
         device = await adapter.requestDevice();
-        output.innerHTML = '✅ WebGPU Ready!\n\nGPU: NVIDIA RTX 3090\nTest: 4 threads with independent read/write pairs\n\nClick to run.';
+        output.innerHTML = '✅ WebGPU Ready!\n\nGPU: NVIDIA RTX 4090\nTest: 4 threads with independent read/write pairs\n\nClick to run.';
         return true;
     } catch (e) {
         output.innerHTML = `❌ Error: ${e.message}`;
